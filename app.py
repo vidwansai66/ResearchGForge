@@ -23,6 +23,9 @@ class ResearchState(TypedDict, total=False):
     research_type: str
     key_concepts: list[str]
     sub_questions: list[str]
+    concept_a: str
+    concept_b: str
+    comparison_context: str
     search_queries: list[str]
     research_plan: list[str]
     retrieved_documents: list[str]
@@ -168,6 +171,9 @@ def _fallback_query_analysis(query: str) -> dict:
         "research_topic": "General AI Research",
         "research_domain": "Unknown / General",
         "research_type": "Other / General Research Question",
+        "concept_a": "",
+        "concept_b": "",
+        "comparison_context": "",
         "key_concepts": words,
         "sub_questions": ["What is the main concept?", "How does it work?"],
         "search_queries": [query]
@@ -190,7 +196,7 @@ def research_query_analyzer(query: str) -> dict:
     if not api_key:
         return _fallback_query_analysis(query)
         
-    llm = ChatGoogleGenerativeAI(model=os.getenv("GEMINI_MODEL", "gemini-1.5-flash"), google_api_key=api_key, temperature=0.1)
+    llm = ChatGoogleGenerativeAI(model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"), google_api_key=api_key, temperature=0.1)
     
     prompt = f"""
     Analyze the following research question: "{query}"
@@ -199,11 +205,14 @@ def research_query_analyzer(query: str) -> dict:
     - "interpreted_query": string (explicit interpretation if ambiguous, else same as query)
     - "requires_current_info": boolean (true if question asks for today, latest, 2026, current info)
     - "research_topic": string
-    - "research_domain": string (e.g., Artificial Intelligence, Healthcare, Unknown / General)
-    - "research_type": string (e.g., Comparison, Explanation, Definition, Cause and effect, Multi-part question, Other / General Research Question)
+    - "research_domain": string (Extract the actual domain like "Computer Science / Software Engineering / Artificial Intelligence". Do NOT default to Unknown/General if recognizable technical concepts are present)
+    - "research_type": string (If the query contains 'compare', 'vs', 'versus', 'difference', 'which is different', etc., it MUST be 'Comparison')
+    - "concept_a": string (If Comparison, extract first concept, else "")
+    - "concept_b": string (If Comparison, extract second concept, else "")
+    - "comparison_context": string (If Comparison, extract the context, e.g., 'Google placement', else "")
     - "key_concepts": list of strings
     - "sub_questions": list of strings (break down if multi-part)
-    - "search_queries": list of strings (3-4 specific search queries optimized for a vector database)
+    - "search_queries": list of strings (Generate specific queries optimized for RAG. Use the extracted concepts, e.g. if comparing AI and DSA for Google, queries should include "DSA", "Artificial Intelligence", "software engineering careers", "technical interviews", etc. Do NOT just output the generic query)
     
     Respond ONLY with valid JSON, without any markdown formatting like ```json.
     """
@@ -225,7 +234,7 @@ def evidence_analyzer(documents_text: str, query: str) -> dict:
     if not api_key:
         return _fallback_evidence_analysis()
         
-    llm = ChatGoogleGenerativeAI(model=os.getenv("GEMINI_MODEL", "gemini-1.5-flash"), google_api_key=api_key, temperature=0.1)
+    llm = ChatGoogleGenerativeAI(model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"), google_api_key=api_key, temperature=0.1)
     
     prompt = f"""
     Evaluate the provided evidence against the research question: "{query}"
@@ -233,13 +242,16 @@ def evidence_analyzer(documents_text: str, query: str) -> dict:
     Evidence:
     {documents_text}
     
-    Determine if the evidence is sufficient to answer the question. 
+    Determine if the evidence actually supports the specific question. 
+    A document about "Embeddings" is NOT automatically relevant to a question about "Compare AI and DSA".
+    Filter weakly relevant documents. If no sufficiently relevant evidence remains, return "Insufficient".
+    
     Return a JSON object with EXACTLY these keys:
-    - "evidence_status": string (MUST be one of: "Strong", "Moderate", "Limited", "Insufficient")
+    - "evidence_status": string ("Strong", "Moderate", "Limited", or "Insufficient" based on ACTUAL relevance and coverage. Do NOT default to Moderate just because docs were retrieved.)
     - "evidence_summary": string (Brief summary of what the evidence covers)
-    - "supported_claims": list of strings (Information directly supported by the evidence that answers the query)
-    - "inferences": list of strings (Reasonable conclusions derived from the evidence)
-    - "unsupported_claims": list of strings (Parts of the query that cannot be answered with this evidence)
+    - "supported_claims": list of strings (ONLY claims directly supported by the text.)
+    - "inferences": list of strings (Reasonable conclusions derived from the evidence.)
+    - "unsupported_claims": list of strings (Claims that CANNOT be verified from the evidence, e.g. if the user asks about Google specifically, but the text is generic industry knowledge, list the Google-specific claim as unsupported.)
     
     Be conservative. If the evidence is completely unrelated to the query, set evidence_status to "Insufficient".
     
@@ -275,6 +287,9 @@ def analyze_question(state: ResearchState) -> ResearchState:
         "research_topic": analysis_result.get("research_topic", ""),
         "research_domain": analysis_result.get("research_domain", "Unknown / General"),
         "research_type": analysis_result.get("research_type", "Other / General Research Question"),
+        "concept_a": analysis_result.get("concept_a", ""),
+        "concept_b": analysis_result.get("concept_b", ""),
+        "comparison_context": analysis_result.get("comparison_context", ""),
         "key_concepts": analysis_result.get("key_concepts", []),
         "sub_questions": analysis_result.get("sub_questions", []),
         "search_queries": analysis_result.get("search_queries", [query]),
@@ -286,13 +301,22 @@ def create_research_plan(state: ResearchState) -> ResearchState:
     q_type = state.get("research_type", "Other / General Research Question")
     
     if q_type == "Comparison":
+        ca = state.get("concept_a", "Concept A")
+        cb = state.get("concept_b", "Concept B")
+        ctx = state.get("comparison_context", "")
         plan = [
-            "1. Identify comparison dimensions",
-            "2. Retrieve evidence for concept A",
-            "3. Retrieve evidence for concept B",
-            "4. Compare evidence",
-            "5. Synthesize"
+            f"1. Identify {ca} and {cb} as the concepts being compared."
         ]
+        if ctx:
+            plan.append(f"2. Identify {ctx} as the comparison context.")
+        plan.extend([
+            f"3. Retrieve evidence about {ca}.",
+            f"4. Retrieve evidence about {cb}.",
+            "5. Check for specific context evidence.",
+            "6. Compare the supported evidence.",
+            "7. Clearly separate evidence from inference.",
+            "8. State limitations where specific evidence is unavailable."
+        ])
     elif q_type in ["Explanation", "Definition", "How-to / mechanism"]:
         plan = [
             "1. Identify concepts",
@@ -441,7 +465,7 @@ Information covering the following concepts: {", ".join(state.get("key_concepts"
     else:
         try:
             llm = ChatGoogleGenerativeAI(
-                model=os.getenv("GEMINI_MODEL", "gemini-1.5-flash"), 
+                model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"), 
                 google_api_key=api_key,
                 temperature=0.3
             )
@@ -485,7 +509,7 @@ Information covering the following concepts: {", ".join(state.get("key_concepts"
             INFERENCE:
             {inferences_text}
             
-            LIMITATION (Unsupported Claims):
+            NOT ESTABLISHED:
             {unsupported_text}
             
             Format exactly like this (use markdown):
@@ -509,15 +533,15 @@ Information covering the following concepts: {", ".join(state.get("key_concepts"
             <numbered plan>
 
             [Adapt the rest of the report based on the RESEARCH TYPE. For example, if Comparison, include COMPARISON CRITERIA, CONCEPT A, CONCEPT B, COMPARISON. If Explanation, include DEFINITION, CORE CONCEPTS, HOW IT WORKS. Include relevant sections dynamically.]
-
-            [ALWAYS Include these distinctions at the end of the analysis:]
+            
+            [ALWAYS Include these distinctions at the end of the analysis. DO NOT claim specific company requirements like "Google requires X" unless the evidence explicitly supports it. Do not turn general industry knowledge into specific factual claims.]
             SUPPORTED BY EVIDENCE
             • ...
 
             INFERENCE
             • ...
 
-            LIMITATION
+            NOT ESTABLISHED
             • ...
             
             [If the question required current info (e.g. 2026), explicitly state that it's unavailable if it wasn't found]
@@ -543,7 +567,16 @@ Information covering the following concepts: {", ".join(state.get("key_concepts"
                     raise invoke_err
 
             content = response.content
-            final_report = str(content).strip()
+            if isinstance(content, list):
+                text_parts = []
+                for part in content:
+                    if isinstance(part, dict) and "text" in part:
+                        text_parts.append(str(part["text"]))
+                    else:
+                        text_parts.append(str(part))
+                final_report = " ".join(text_parts).strip()
+            else:
+                final_report = str(content).strip()
             
             if final_report.startswith("```markdown"): final_report = final_report[11:]
             elif final_report.startswith("```"): final_report = final_report[3:]
