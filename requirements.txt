@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+langchain
+langchain-core
+langchain-community
+langgraph
+langserve
+langchain-google-genai
+pydantic
+sse-starlette
