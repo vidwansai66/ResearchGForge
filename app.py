@@ -1,4 +1,5 @@
 import os
+import time
 import json
 from typing import List, Dict, Any, Optional
 from typing_extensions import TypedDict
@@ -459,7 +460,21 @@ def generate_report(state: ResearchState) -> ResearchState:
             
             DO NOT include the EVIDENCE USED or AGENT EXECUTION sections in your response.
             '''
-            response = llm.invoke(prompt)
+            
+            max_retries = 2
+            backoff = 1
+            for attempt in range(max_retries + 1):
+                try:
+                    response = llm.invoke(prompt)
+                    break
+                except Exception as invoke_err:
+                    err_str = str(invoke_err)
+                    if ("503" in err_str or "UNAVAILABLE" in err_str) and attempt < max_retries:
+                        time.sleep(backoff)
+                        backoff *= 2
+                        continue
+                    raise invoke_err
+
             content = response.content
             if isinstance(content, list):
                 text_parts = []
