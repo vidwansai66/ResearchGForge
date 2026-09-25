@@ -16,21 +16,26 @@ from langchain_core.tools import tool
 # 1. State Definition
 class ResearchState(TypedDict, total=False):
     user_query: str
+    interpreted_query: str
+    requires_current_info: bool
     research_topic: str
+    research_domain: str
     research_type: str
     key_concepts: list[str]
     sub_questions: list[str]
+    search_queries: list[str]
     research_plan: list[str]
     retrieved_documents: list[str]
     retrieved_sources: list[str]
+    evidence_status: str
     evidence_summary: str
-    key_findings: list[str]
-    advantages: list[str]
-    limitations: list[str]
-    comparison_points: list[str]
+    supported_claims: list[str]
+    inferences: list[str]
+    unsupported_claims: list[str]
     final_report: str
     execution_steps: list[str]
     tools_executed: list[str]
+    quota_exhausted: bool
 
 # 2. Knowledge Base
 KNOWLEDGE_BASE = [
@@ -155,91 +160,101 @@ def get_vector_store():
         
     return vector_store
 
-# 3. Tools
-@tool
-def research_query_analyzer(query: str) -> dict:
-    """Analyzes a research question to identify the topic, type, key concepts, and sub-questions."""
-    query_lower = query.lower()
-    
-    # Deterministic Type Detection
-    if "compare" in query_lower or "vs" in query_lower or "difference" in query_lower:
-        r_type = "Comparison"
-    elif "advantage" in query_lower or "limitation" in query_lower or "pros" in query_lower or "cons" in query_lower:
-        r_type = "Advantages and limitations"
-    elif "application" in query_lower or "use case" in query_lower:
-        r_type = "Applications"
-    elif "how" in query_lower or "architecture" in query_lower:
-        r_type = "Architecture"
-    else:
-        r_type = "Explanation"
-        
-    # Deterministic Concept Extraction
-    stop_words = {"what", "are", "the", "and", "how", "do", "in", "a", "an", "of", "for", "to"}
-    words = [w for w in query.replace("?", "").replace(".", "").split() if w.lower() not in stop_words and len(w) > 2]
-    
-    return {
-        "research_topic": " ".join(words[:3]) if words else "General Topic",
-        "research_type": r_type,
-        "key_concepts": words,
-        "sub_questions": [f"What is {words[0]}?" if words else "What is this topic?", "How does it work?"]
-    }
-
 def _fallback_query_analysis(query: str) -> dict:
     words = [w for w in query.split() if len(w) > 4]
     return {
+        "interpreted_query": query,
+        "requires_current_info": False,
         "research_topic": "General AI Research",
-        "research_type": "Explanation",
+        "research_domain": "Unknown / General",
+        "research_type": "Other / General Research Question",
         "key_concepts": words,
-        "sub_questions": ["What is the main concept?", "How does it work?"]
-    }
-
-@tool
-def evidence_analyzer(documents_text: str) -> dict:
-    """Analyzes retrieved evidence to extract key findings, advantages, limitations, and comparisons."""
-    # Deterministic Extraction from formatted Knowledge Base
-    advantages = []
-    limitations = []
-    applications = []
-    key_findings = []
-    
-    import re
-    adv_matches = re.findall(r'Advantages:\s*(.*?)(?=\. |Limitation|Application|Important|$)', documents_text, re.IGNORECASE | re.DOTALL)
-    for m in adv_matches:
-        advantages.extend([a.strip() for a in m.split(',') if a.strip()])
-        
-    lim_matches = re.findall(r'Limitations:\s*(.*?)(?=\. |Advantage|Application|Important|$)', documents_text, re.IGNORECASE | re.DOTALL)
-    for m in lim_matches:
-        limitations.extend([l.strip() for l in m.split(',') if l.strip()])
-        
-    app_matches = re.findall(r'Applications:\s*(.*?)(?=\. |Advantage|Limitation|Important|$)', documents_text, re.IGNORECASE | re.DOTALL)
-    for m in app_matches:
-        applications.extend([a.strip() for a in m.split(',') if a.strip()])
-        
-    # Extract titles as findings context
-    titles = re.findall(r'Title:\s*(.*?)(?=\n|$)', documents_text, re.IGNORECASE)
-    if not titles:
-        # Fallback if no explicit Title: metadata exists in text format
-        key_findings.append("Evidence reviewed and summarized.")
-    else:
-        for t in titles:
-            key_findings.append(f"Analyzed concepts related to {t.strip()}")
-            
-    return {
-        "key_findings": key_findings if key_findings else ["Found relevant information."],
-        "advantages": list(set(advantages)),
-        "limitations": list(set(limitations)),
-        "comparison_points": [f"Compared {len(set(advantages))} advantages against {len(set(limitations))} limitations."] if advantages and limitations else [],
-        "evidence_summary": "Retrieved explicit advantages, limitations, and applications from the knowledge base."
+        "sub_questions": ["What is the main concept?", "How does it work?"],
+        "search_queries": [query]
     }
 
 def _fallback_evidence_analysis() -> dict:
     return {
-        "key_findings": ["Information retrieved successfully."],
-        "advantages": ["Provides context."],
-        "limitations": ["Limited to context."],
-        "comparison_points": [],
-        "evidence_summary": "The retrieved documents provide foundational context."
+        "evidence_status": "Moderate",
+        "evidence_summary": "The retrieved documents provide foundational context.",
+        "supported_claims": ["Information retrieved successfully."],
+        "inferences": ["Provides context."],
+        "unsupported_claims": ["Limited to context."]
     }
+
+# 3. Tools
+@tool
+def research_query_analyzer(query: str) -> dict:
+    """Analyzes a research question to identify the topic, domain, type, key concepts, sub-questions, and search queries."""
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        return _fallback_query_analysis(query)
+        
+    llm = ChatGoogleGenerativeAI(model=os.getenv("GEMINI_MODEL", "gemini-1.5-flash"), google_api_key=api_key, temperature=0.1)
+    
+    prompt = f"""
+    Analyze the following research question: "{query}"
+    
+    Return a JSON object with EXACTLY these keys:
+    - "interpreted_query": string (explicit interpretation if ambiguous, else same as query)
+    - "requires_current_info": boolean (true if question asks for today, latest, 2026, current info)
+    - "research_topic": string
+    - "research_domain": string (e.g., Artificial Intelligence, Healthcare, Unknown / General)
+    - "research_type": string (e.g., Comparison, Explanation, Definition, Cause and effect, Multi-part question, Other / General Research Question)
+    - "key_concepts": list of strings
+    - "sub_questions": list of strings (break down if multi-part)
+    - "search_queries": list of strings (3-4 specific search queries optimized for a vector database)
+    
+    Respond ONLY with valid JSON, without any markdown formatting like ```json.
+    """
+    try:
+        response = llm.invoke(prompt)
+        text = response.content.strip()
+        if text.startswith("```json"): text = text[7:]
+        if text.startswith("```"): text = text[3:]
+        if text.endswith("```"): text = text[:-3]
+        return json.loads(text.strip())
+    except Exception as e:
+        print(f"Error in query analyzer: {e}")
+        return _fallback_query_analysis(query)
+
+@tool
+def evidence_analyzer(documents_text: str, query: str) -> dict:
+    """Analyzes retrieved evidence to evaluate relevance, extract supported claims, inferences, and unsupported claims."""
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        return _fallback_evidence_analysis()
+        
+    llm = ChatGoogleGenerativeAI(model=os.getenv("GEMINI_MODEL", "gemini-1.5-flash"), google_api_key=api_key, temperature=0.1)
+    
+    prompt = f"""
+    Evaluate the provided evidence against the research question: "{query}"
+    
+    Evidence:
+    {documents_text}
+    
+    Determine if the evidence is sufficient to answer the question. 
+    Return a JSON object with EXACTLY these keys:
+    - "evidence_status": string (MUST be one of: "Strong", "Moderate", "Limited", "Insufficient")
+    - "evidence_summary": string (Brief summary of what the evidence covers)
+    - "supported_claims": list of strings (Information directly supported by the evidence that answers the query)
+    - "inferences": list of strings (Reasonable conclusions derived from the evidence)
+    - "unsupported_claims": list of strings (Parts of the query that cannot be answered with this evidence)
+    
+    Be conservative. If the evidence is completely unrelated to the query, set evidence_status to "Insufficient".
+    
+    Respond ONLY with valid JSON, without any markdown formatting.
+    """
+    try:
+        response = llm.invoke(prompt)
+        text = response.content.strip()
+        if text.startswith("```json"): text = text[7:]
+        if text.startswith("```"): text = text[3:]
+        if text.endswith("```"): text = text[:-3]
+        return json.loads(text.strip())
+    except Exception as e:
+        print(f"Error in evidence analyzer: {e}")
+        return _fallback_evidence_analysis()
 
 # 4. LangGraph Nodes
 def analyze_question(state: ResearchState) -> ResearchState:
@@ -255,46 +270,62 @@ def analyze_question(state: ResearchState) -> ResearchState:
         
     return {
         **state,
+        "interpreted_query": analysis_result.get("interpreted_query", query),
+        "requires_current_info": analysis_result.get("requires_current_info", False),
         "research_topic": analysis_result.get("research_topic", ""),
-        "research_type": analysis_result.get("research_type", ""),
+        "research_domain": analysis_result.get("research_domain", "Unknown / General"),
+        "research_type": analysis_result.get("research_type", "Other / General Research Question"),
         "key_concepts": analysis_result.get("key_concepts", []),
         "sub_questions": analysis_result.get("sub_questions", []),
+        "search_queries": analysis_result.get("search_queries", [query]),
         "execution_steps": steps,
         "tools_executed": tools_exec
     }
 
 def create_research_plan(state: ResearchState) -> ResearchState:
-    query = state.get("user_query", "")
-    topic = state.get("research_topic", "")
-    q_type = state.get("research_type", "")
+    q_type = state.get("research_type", "Other / General Research Question")
     
     if q_type == "Comparison":
         plan = [
-            f"1. Understand {topic}",
-            "2. Identify the core differences between the concepts",
-            "3. Compare their advantages",
-            "4. Compare their limitations",
-            "5. Determine the best use cases for each"
+            "1. Identify comparison dimensions",
+            "2. Retrieve evidence for concept A",
+            "3. Retrieve evidence for concept B",
+            "4. Compare evidence",
+            "5. Synthesize"
         ]
-    elif q_type == "Advantages and limitations":
+    elif q_type in ["Explanation", "Definition", "How-to / mechanism"]:
         plan = [
-            f"1. Define {topic}",
-            "2. Extract key advantages",
-            "3. Extract key limitations",
-            "4. Summarize trade-offs"
+            "1. Identify concepts",
+            "2. Retrieve relevant evidence",
+            "3. Explain concepts",
+            "4. Synthesize"
+        ]
+    elif q_type == "Cause and effect":
+        plan = [
+            "1. Identify causes",
+            "2. Retrieve evidence",
+            "3. Analyze relationships",
+            "4. Synthesize"
+        ]
+    elif q_type == "Applications":
+        plan = [
+            "1. Identify domain",
+            "2. Retrieve application evidence",
+            "3. Analyze use cases",
+            "4. Limitations",
+            "5. Synthesize"
         ]
     else:
         plan = [
-            f"1. Introduce {topic}",
-            "2. Explain core mechanics",
-            "3. Provide examples or applications",
-            "4. Conclude findings"
+            "1. General research analysis",
+            "2. Retrieve evidence",
+            "3. Evaluate evidence",
+            "4. Synthesize if sufficient"
         ]
-    
-    if not plan:
-        plan = ["1. Understand the topic.", "2. Synthesize report."]
         
     steps = state.get("execution_steps", [])
+    steps.append(f"Question type detected: {q_type}")
+    steps.append(f"Domain detected: {state.get('research_domain', 'Unknown / General')}")
     steps.append("Research plan created")
     
     return {
@@ -304,19 +335,24 @@ def create_research_plan(state: ResearchState) -> ResearchState:
     }
 
 def retrieve_evidence(state: ResearchState) -> ResearchState:
-    query = state.get("user_query", "")
-    concepts = state.get("key_concepts", [])
+    search_queries = state.get("search_queries", [state.get("user_query", "")])
     
     vs = get_vector_store()
     retrieved_docs = []
     retrieved_sources = []
     
     if vs is not None:
-        search_query = query + " " + " ".join(concepts)
-        results = vs.similarity_search(search_query, k=4)
-        for r in results:
-            retrieved_docs.append(r.page_content)
-            retrieved_sources.append(r.metadata.get("title", "Unknown Source"))
+        all_results = []
+        for q in search_queries:
+            results = vs.similarity_search(q, k=3)
+            all_results.extend(results)
+            
+        seen = set()
+        for r in all_results:
+            if r.page_content not in seen:
+                seen.add(r.page_content)
+                retrieved_docs.append(r.page_content)
+                retrieved_sources.append(r.metadata.get("title", "Unknown Source"))
     else:
         retrieved_docs = ["Error: Knowledge base vector store not initialized."]
         retrieved_sources = ["Error"]
@@ -333,24 +369,30 @@ def retrieve_evidence(state: ResearchState) -> ResearchState:
 
 def analyze_evidence(state: ResearchState) -> ResearchState:
     docs = state.get("retrieved_documents", [])
+    query = state.get("interpreted_query", state.get("user_query", ""))
     docs_text = "\n\n".join(docs)
     
-    analysis_result = evidence_analyzer.invoke({"documents_text": docs_text})
+    analysis_result = evidence_analyzer.invoke({"documents_text": docs_text, "query": query})
     
     steps = state.get("execution_steps", [])
+    steps.append("Evidence relevance evaluated")
     steps.append("Evidence analyzer executed")
     
     tools_exec = state.get("tools_executed", [])
     if "evidence_analyzer" not in tools_exec:
         tools_exec.append("evidence_analyzer")
         
+    evidence_status = analysis_result.get("evidence_status", "Insufficient")
+    if evidence_status == "Insufficient":
+        steps.append("⚠ Insufficient relevant evidence")
+        
     return {
         **state,
-        "key_findings": analysis_result.get("key_findings", []),
-        "advantages": analysis_result.get("advantages", []),
-        "limitations": analysis_result.get("limitations", []),
-        "comparison_points": analysis_result.get("comparison_points", []),
+        "evidence_status": evidence_status,
         "evidence_summary": analysis_result.get("evidence_summary", ""),
+        "supported_claims": analysis_result.get("supported_claims", []),
+        "inferences": analysis_result.get("inferences", []),
+        "unsupported_claims": analysis_result.get("unsupported_claims", []),
         "execution_steps": steps,
         "tools_executed": tools_exec
     }
@@ -358,63 +400,93 @@ def analyze_evidence(state: ResearchState) -> ResearchState:
 def generate_report(state: ResearchState) -> ResearchState:
     api_key = os.getenv("GEMINI_API_KEY")
     success = True
+    
     if not api_key:
         final_report = "Error: GEMINI_API_KEY is missing. Cannot generate report."
+        success = False
+    elif state.get("evidence_status") == "Insufficient":
+        question = state.get("user_query", "")
+        req_current = state.get("requires_current_info", False)
+        
+        current_msg = ""
+        if req_current:
+            current_msg = "This question requires current/live information that is not available through my current research sources.\n\n"
+            
+        final_report = f"""━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔬 RESEARCHFORGE AI
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+QUESTION STATUS
+Insufficient Evidence
+
+QUESTION
+{question}
+
+WHY
+{current_msg}The current ResearchForge knowledge base does not contain enough relevant evidence for this question.
+
+ANALYSIS
+The question was successfully analyzed. It was classified as '{state.get("research_type")}' in the domain of '{state.get("research_domain")}'.
+
+WHAT I CAN DO
+I can analyze the question structure and identify what evidence would be required.
+
+EVIDENCE STATUS
+Insufficient relevant evidence
+
+WHAT WOULD BE NEEDED
+Information covering the following concepts: {", ".join(state.get("key_concepts", []))}"""
+        
         success = False
     else:
         try:
             llm = ChatGoogleGenerativeAI(
-                model=os.getenv("GEMINI_MODEL", "gemini-3.8-flash"), 
+                model=os.getenv("GEMINI_MODEL", "gemini-1.5-flash"), 
                 google_api_key=api_key,
                 temperature=0.3
             )
             
-            query_text = str(state.get('user_query', '')).strip()
-            topic_text = str(state.get('research_topic', '')).strip()
+            query_text = str(state.get('interpreted_query', state.get('user_query', ''))).strip()
             type_text = str(state.get('research_type', '')).strip()
+            status_text = str(state.get('evidence_status', 'Limited')).strip()
+            req_current = state.get('requires_current_info', False)
             
+            current_msg = ""
+            if req_current:
+                current_msg = "Note: This question asks for current/live information which is not fully available in the local evidence base. The answer relies on available local evidence.\n\n"
+                
             plan_list = state.get('research_plan', [])
             plan_text = "\n".join(str(item) for item in plan_list) if isinstance(plan_list, list) else str(plan_list)
             
-            findings_list = state.get('key_findings', [])
-            findings_text = "\n".join(f"• {item}" for item in findings_list) if isinstance(findings_list, list) else str(findings_list)
+            supp_list = state.get('supported_claims', [])
+            supported_text = "\n".join(f"• {item}" for item in supp_list) if isinstance(supp_list, list) else str(supp_list)
             
-            adv_list = state.get('advantages', [])
-            advantages_text = "\n".join(f"• {item}" for item in adv_list) if isinstance(adv_list, list) else str(adv_list)
+            inf_list = state.get('inferences', [])
+            inferences_text = "\n".join(f"• {item}" for item in inf_list) if isinstance(inf_list, list) else str(inf_list)
             
-            lim_list = state.get('limitations', [])
-            limitations_text = "\n".join(f"• {item}" for item in lim_list) if isinstance(lim_list, list) else str(lim_list)
-            
-            comp_list = state.get('comparison_points', [])
-            comparison_text = "\n".join(f"• {item}" for item in comp_list) if isinstance(comp_list, list) else str(comp_list)
-            
-            summary_text = str(state.get('evidence_summary', '')).strip()
+            unsupp_list = state.get('unsupported_claims', [])
+            unsupported_text = "\n".join(f"• {item}" for item in unsupp_list) if isinstance(unsupp_list, list) else str(unsupp_list)
             
             prompt = f'''
             You are ResearchForge AI.
-            Generate a structured research report using ONLY the provided state.
+            Generate a structured research report using ONLY the provided state. Do NOT hallucinate.
             
             USER QUERY: {query_text}
-            RESEARCH TOPIC: {topic_text}
             RESEARCH TYPE: {type_text}
+            EVIDENCE STATUS: {status_text}
+            {current_msg}
             
             RESEARCH PLAN:
             {plan_text}
             
-            KEY FINDINGS:
-            {findings_text}
+            SUPPORTED BY EVIDENCE:
+            {supported_text}
             
-            ADVANTAGES:
-            {advantages_text}
+            INFERENCE:
+            {inferences_text}
             
-            LIMITATIONS:
-            {limitations_text}
-            
-            COMPARISON POINTS:
-            {comparison_text}
-            
-            EVIDENCE SUMMARY:
-            {summary_text}
+            LIMITATION (Unsupported Claims):
+            {unsupported_text}
             
             Format exactly like this (use markdown):
             ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -426,6 +498,9 @@ def generate_report(state: ResearchState) -> ResearchState:
 
             RESEARCH TYPE
             <type>
+            
+            EVIDENCE STATUS
+            {status_text}
 
             EXECUTIVE SUMMARY
             <summary based on evidence>
@@ -433,32 +508,24 @@ def generate_report(state: ResearchState) -> ResearchState:
             RESEARCH PLAN
             <numbered plan>
 
-            KEY FINDINGS
+            [Adapt the rest of the report based on the RESEARCH TYPE. For example, if Comparison, include COMPARISON CRITERIA, CONCEPT A, CONCEPT B, COMPARISON. If Explanation, include DEFINITION, CORE CONCEPTS, HOW IT WORKS. Include relevant sections dynamically.]
+
+            [ALWAYS Include these distinctions at the end of the analysis:]
+            SUPPORTED BY EVIDENCE
             • ...
 
-            DETAILED ANALYSIS
-            <detailed analysis>
+            INFERENCE
+            • ...
+
+            LIMITATION
+            • ...
             
-            [Include ADVANTAGES section if advantages exist]
-            ADVANTAGES
-            • ...
-
-            [Include LIMITATIONS section if limitations exist]
-            LIMITATIONS
-            • ...
-
-            [Include COMPARISON section if it is a comparison type]
-            COMPARISON
-            ...
-
-            [Include APPLICATIONS section if applications exist in the concepts or findings]
-            APPLICATIONS
-            ...
+            [If the question required current info (e.g. 2026), explicitly state that it's unavailable if it wasn't found]
 
             CONCLUSION
             ...
             
-            DO NOT include the EVIDENCE USED or AGENT EXECUTION sections in your response.
+            DO NOT include the EVIDENCE USED or AGENT EXECUTION sections in your response. DO NOT hallucinate facts.
             '''
             
             max_retries = 2
@@ -476,16 +543,13 @@ def generate_report(state: ResearchState) -> ResearchState:
                     raise invoke_err
 
             content = response.content
-            if isinstance(content, list):
-                text_parts = []
-                for part in content:
-                    if isinstance(part, dict) and "text" in part:
-                        text_parts.append(str(part["text"]))
-                    else:
-                        text_parts.append(str(part))
-                final_report = " ".join(text_parts).strip()
-            else:
-                final_report = str(content).strip()
+            final_report = str(content).strip()
+            
+            if final_report.startswith("```markdown"): final_report = final_report[11:]
+            elif final_report.startswith("```"): final_report = final_report[3:]
+            if final_report.endswith("```"): final_report = final_report[:-3]
+            final_report = final_report.strip()
+            
         except Exception as e:
             error_str = str(e)
             if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str or "quota" in error_str.lower():
@@ -497,21 +561,24 @@ def generate_report(state: ResearchState) -> ResearchState:
             
     report = final_report + "\n\n"
     
-    report += "EVIDENCE USED\n\n"
-    sources = state.get("retrieved_sources", [])
-    unique_sources = []
-    for s in sources:
-        if s not in unique_sources and s != "Error":
-            unique_sources.append(s)
-            
-    for idx, source in enumerate(unique_sources):
-        report += f"{idx+1}. {source}\n"
+    if state.get("evidence_status") != "Insufficient":
+        report += "EVIDENCE USED\n\n"
+        sources = state.get("retrieved_sources", [])
+        unique_sources = []
+        for s in sources:
+            if s not in unique_sources and s != "Error":
+                unique_sources.append(s)
+                
+        for idx, source in enumerate(unique_sources):
+            report += f"{idx+1}. {source}\n"
         
     report += "\nAGENT EXECUTION\n"
     for step in state.get("execution_steps", []):
         report += f"✓ {step}\n"
         
-    if success:
+    if state.get("evidence_status") == "Insufficient":
+        report += "✗ Report synthesis skipped\n"
+    elif success:
         report += "✓ Report synthesized\n"
     else:
         if state.get("quota_exhausted"):
@@ -530,7 +597,9 @@ def generate_report(state: ResearchState) -> ResearchState:
     report += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
     steps = state.get("execution_steps", [])
-    if success:
+    if state.get("evidence_status") == "Insufficient":
+        pass
+    elif success:
         steps.append("Report synthesized")
     else:
         steps.append("Report synthesis failed")
